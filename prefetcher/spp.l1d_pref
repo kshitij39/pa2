@@ -1,16 +1,170 @@
 #include "cache.h"
 
+using namespace std;
+
+#define IP_TRACKER_COUNT 24
+#define PATTERN_TABLE_SIZE 128
+#define MASK_IP 0xFF
+
+#define MAX_DEGREE 4
+#define MIN_DEGREE 1
+#define ACCURACY_INTERVAL 256
+
+#define CONF_MAX 3
+#define CONF_THRESHOLD 2
+
+//a pattern table which stores different signatures and their next fetch
+class PATTERN_ENTRY{
+    public:
+    int64_t stride;
+    uint8_t confidence;
+    bool valid;
+
+    PATTERN_ENTRY(){
+        stride(0);
+        confidence(0);
+        valid(false);
+    }
+};
+
+//IP tracker table as in l1d prefetcher file
+class IP_TRACKER{
+    public:
+    uint64_t ip;
+    uint64_t last_cl_addr;
+    int64_t last_stride;
+
+    uint32_t lru;
+
+    uint8_t stride_confidence  //for uniform stride
+    uint16_t signature;        //16bit to compare last 3 strides to get next stride
+
+    IP_TRACKER(){
+        ip=0;
+        last_cl_addr=0;
+        last_stride=0;
+        stride_confidence=0;
+        signature=0;
+        lru=0;
+    }    
+};
+
+static IP_TRACKER trackers[IP_TRACKER_COUNT];
+static PATTERN_ENTRY pattern_table[PATTERN_TABLE_SIZE];
+
+static uint64_t total_prefetches=0;
+static uint64_t useful_prefetches=0;
+static uint32_t current_degree=2;
+
+
+
 
 void CACHE::l1d_prefetcher_initialize() 
 {
     std::cout << "------------------------------------------------" << std::endl;
     std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
+
+    for(int i=0;i<IP_TRACKER_COUNT;i++){
+        trackers[i]=IP_TRACKER();
+        trackers[i].lru=i;
+    }
+
+    for(int i=0;i<PATTERN_TABLE_SIZE;i++){
+        pattern_table[i]=PATTERN_ENTRY();
+    }
+
+    total_prefetches=0;
+    useful_prefetches=0;
+    current_degree=2;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+   uint64_t cl_addr =addr>>LOG2_BLOCK_SIZE;
+   ip=ip&MASK_IP;
+
+   evaluate_accuracy();
+
+   //checking for ip in ip tracker table
+   int index=-1;
+   for(index=0;index<IP_TRACKER_COUNT;index++){
+    if(ip==trackers[index].ip)
+        break;
+   }
+   //on miss index=IP_TRACKER_COUNT
+
+   if(index==IP_TRACKER_COUNT){
+    for(index=0;index<IP_TRACKER_COUNT;index++){
+        if(trackers[index].lru==(IP_TRACKER_COUNT-1)){
+            //find ip entry with largest lru so least recently used
+            break;
+        }
+    }
+    trackers[index].ip=ip;
+    trackers[index].last_cl_addr=cl_addr;
+    trackers[index].last_stride=0;
+    trackers[index].stride_confidence=0;
+    trackers[index].signature=0;
+
+    //update lru of others by incrementing them
+    for(int i=0;i<IP_TRACKER_COUNT;i++){
+        if(trackers[i].lru<trackers[index].lru)
+            trackers[i].lru++;
+    }
+    trackers[index].lru=0;
+    return;
+   }
+   if(index==-1) assert(0);
+   //till now updated ip trackers table with new ip
+
+   //compute stride
+    int64_t stride=0;
+    if(cl_addr>trackers[index].last_cl_addr){
+        stride=cl_addr-trackers[index].last_cl_addr;
+    }
+    else{
+        stride=trackers[index].last_cl_addr - cl_addr;
+        stride=stride*-1;
+    }
+    if(stride==0) return;
+
+    //counter for uniform stride
+    if(stride==trackers[index].last_stride){
+        if(trackers[index].confidence <CONF_THRESHOLD){
+            trackers[index].confidence++;
+        }
+    }
+    else{
+        if(trackers[index].confidence>0){
+            trackers[index].confidence--;
+        }
+    }
+
+    //when to use uniform
+    bool use_uniform=(trackers[index].confidence>=CONF_THRESHOLD);
+
+    if(use_uniform){
+        for(uint32 i=0;i<current_degree;i++){
+            uint64_t pf_cl_addr=cl_addr +(stride*i);
+            //issue prefetch
+        }
+    }
+    else{
+        
+    }
+
+
+
+
+
+
+
+
+
+
+
+
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
