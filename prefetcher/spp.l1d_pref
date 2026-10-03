@@ -243,10 +243,19 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
 {
-	return; //metadata_in;
+	//return; //metadata_in;
+    if(prefetch){
+        useful_prefetches++;
+    }
 }
 
 void CACHE::l1d_prefetcher_final_stats()
 {
-
+    cout<<"CPU "<<cpu<<" L1D Dual-Pattern Stride Prefetcher Final Stats"<<endl;
+    cout<<"Total Prefetches Issued: "<<total_prefetches<<endl;
+    cout<<"Useful Prefetches Fills: "<<useful_prefetches<<endl;
+    if (total_prefetches > 0) {
+        cout<<"Overall Accuracy   : "<<(double)useful_prefetches / total_prefetches * 100.0<<"%"<<endl;
+    }
+    cout<<"Final Prefetch Degree  : "<<current_degree<<endl;
 }
