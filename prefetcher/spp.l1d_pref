@@ -58,6 +58,15 @@ static uint32_t current_degree=2;
 
 //4 Helper functions
 
+static inline uint32_t get_pattern_trackers(uint16_t sig){
+    return (sig^(sig>>4))%PATTERN_TABLE_SIZE;
+}
+
+static inline uint16_t update_signature(uint16_t current_sig,int64_t stride){
+    uint8_t compact_stride=(uint8_t)(stride & 0x0F);
+    return ((current_sig<<4) | compact_stride)& 0x0FFF;
+}
+
 static inline void evaluate_accuracy(){
     if(total_prefetches<ACCURACY_INTERVAL) return;
 
@@ -193,20 +202,42 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         }
     }
     else{
-        
+        //update pattern table entry
+        uint32_t pat_idx=get_pattern_trackers(trackers[index].signature);
+        pattern_table[pat_idx].stride=stride;
+        pattern_table[pat_idx].valid=true;
+
+        //traverse for non uniform
+        uint16_t temp_sig=trackers[index].signature;
+        uint64_t curr_pf_cl=cl_addr;
+
+        for(uint32_t i=1;i<=current_degree;i++){
+            uint32_t lookup_idx =get_pattern_trackers(temp_sig);
+            if(!pattern_table[lookup_idx].valid || pattern_table[lookup_idx].stride==0)
+                break;
+            
+            int64_t expected_stride=pattern_table[lookup_idx].stride;
+            curr_pf_cl+=expected_stride;
+
+            if(!issue_prefetch(this,ip,addr,curr_pf_cl))
+                break;
+
+            temp_sig=update_signature(temp_sig,expected_stride);        
+        }
 
     }
 
+    //update tracker state and signature
+    trackers[index].signature=update_signature(trackers[index].signature,stride);
+    trackers[index].last_cl_addr=cl_addr;
+    trackers[index].last_stride=stride;
 
-
-
-
-
-
-
-
-
-
+    //lru update
+    for(int i=0;i<IP_TRACKER_COUNT;i++){
+        if(trackers[i].lru <trackers[index].lru)
+            trackers[i].lru++;
+    }
+    trackers[index].lru=0;
 
 }
 
