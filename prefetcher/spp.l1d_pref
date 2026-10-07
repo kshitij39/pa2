@@ -21,9 +21,9 @@ class PATTERN_ENTRY{
     bool valid;
 
     PATTERN_ENTRY(){
-        stride(0);
-        confidence(0);
-        valid(false);
+        stride=0;
+        confidence=0;
+        valid=false;
     }
 };
 
@@ -36,7 +36,7 @@ class IP_TRACKER{
 
     uint32_t lru;
 
-    uint8_t stride_confidence  //for uniform stride
+    uint8_t stride_confidence;  //for uniform stride
     uint16_t signature;        //16bit to compare last 3 strides to get next stride
 
     IP_TRACKER(){
@@ -86,16 +86,16 @@ static inline void evaluate_accuracy(){
     useful_prefetches=useful_prefetches>>1;
 }
 
-static inline bool issue_prefetch(CACHE* cache,unit64_t demand_addr,uint64_t pf_cl_addr){
+static inline bool issue_prefetch(CACHE* cache,uint64_t ip,uint64_t demand_addr,uint64_t pf_cl_addr){
     uint64_t pf_address=pf_cl_addr>>LOG2_BLOCK_SIZE;
 
     //inside page boundary
-    if((pf_address>>LOG2_BLOCK_SIZE)!=(demand_addr>>LOG2_BLOCK_SIZE)){
+    if((pf_address>>LOG2_PAGE_SIZE)!=(demand_addr>>LOG2_PAGE_SIZE)){
         return false;
     }
 
     //adjust fill level based on l1d MSHR
-    if(cache>MSHR.occupancy<(cache.MSHR.SIZE>>1)){
+    if(cache->MSHR.occupancy<(cache->MSHR.SIZE>>1)){
         cache->prefetch_line(ip,demand_addr,pf_address,FILL_L1,0);
     }
     else{
@@ -180,21 +180,21 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
     //counter for uniform stride
     if(stride==trackers[index].last_stride){
-        if(trackers[index].confidence <CONF_THRESHOLD){
-            trackers[index].confidence++;
+        if(trackers[index].stride_confidence <CONF_MAX){
+            trackers[index].stride_confidence++;
         }
     }
     else{
-        if(trackers[index].confidence>0){
-            trackers[index].confidence--;
+        if(trackers[index].stride_confidence>0){
+            trackers[index].stride_confidence--;
         }
     }
 
     //when to use uniform
-    bool use_uniform=(trackers[index].confidence>=CONF_THRESHOLD);
+    bool use_uniform=(trackers[index].stride_confidence>=CONF_THRESHOLD);
 
     if(use_uniform){
-        for(uint32 i=0;i<current_degree;i++){
+        for(uint32_t i=0;i<current_degree;i++){
             uint64_t pf_cl_addr=cl_addr +(stride*i);
             //issue prefetch
             if(!issue_prefetch(this,ip,addr,pf_cl_addr))
