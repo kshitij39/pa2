@@ -2,11 +2,24 @@
 
 
 #define IP_TRACKER_COUNT 24
-#define PREFETCH_DEGREE 3
+
 #define MASK_IP 0xFF
 #define UNIFORM_CONFIDENCE_LEVELS 1
-#define NON_UNIFORM_PATTERN_MAX_LENGTH 100  //actual max length would be half of this
+#define NON_UNIFORM_PATTERN_MAX_LENGTH 32  //actual max length would be half of this
 
+#define CONF_MAX 3
+#define CONF_THRESHOLD 2
+
+#define THROTTLE_WINDOW 256
+#define ACC_HIGH 0.75
+#define ACC_MID  0.40
+#define ACC_LOW  0.20
+#define DEG_HIGH 4
+#define DEG_MID  3
+#define DEG_LOW  2
+#define DEG_MIN  1
+
+namespace{
 class IP_TRACKER {
   public:
     // the IP we're tracking
@@ -34,6 +47,8 @@ class IP_TRACKER {
     // use LRU to evict old IP trackers
     uint32_t lru;
 
+    uint8_t confidence;
+
     IP_TRACKER () {
         ip = 0;
         last_cl_addr = 0;
@@ -51,6 +66,7 @@ class IP_TRACKER {
 	    found = false;
 	    
 	    mode = 0;
+        confidence=0;
 	    
         lru = 0;
     };
@@ -59,6 +75,48 @@ class IP_TRACKER {
 IP_TRACKER trackers[IP_TRACKER_COUNT];
 
 
+uint32_t current_degree  = DEG_MID;
+uint64_t window_issued   = 0;   
+uint64_t useful_snapshot = 0;
+uint64_t total_issued    = 0; 
+uint64_t total_useful    = 0;   
+uint64_t degree_windows[DEG_HIGH + 1] = {0};
+
+void update_degree(CACHE *c)
+{
+    if (c->pf_useful < useful_snapshot) {  
+        useful_snapshot = c->pf_useful;
+        window_issued = 0;
+        total_issued = 0;
+        return;
+    }
+    total_useful = c->pf_useful;
+    if (window_issued < THROTTLE_WINDOW)
+        return;
+
+    double acc = (double)(c->pf_useful - useful_snapshot) / window_issued;
+    if      (acc >= ACC_HIGH) current_degree = DEG_HIGH;
+    else if (acc >= ACC_MID)  current_degree = DEG_MID;
+    else if (acc >= ACC_LOW)  current_degree = DEG_LOW;
+    else                      current_degree = DEG_MIN;
+    degree_windows[current_degree]++;
+
+    window_issued = 0;
+    useful_snapshot = c->pf_useful;
+}
+
+bool issue_pf(CACHE *c, uint64_t ip, uint64_t addr, uint64_t pf_address)
+{
+    if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+        return false;
+    int ok = (c->MSHR.occupancy < (c->MSHR.SIZE >> 1))
+             ? c->prefetch_line(ip, addr, pf_address, FILL_L1, 0)
+             : c->prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+    if (ok) { window_issued++; total_issued++; }
+    return true;
+}
+
+}
 void CACHE::l1d_prefetcher_initialize() 
 {
     std::cout << "------------------------------------------------" << std::endl;
@@ -78,6 +136,7 @@ void uniform_reset(int index)
 	    	trackers[index].last_strides[j] = 0;
 	trackers[index].ls_index = 0;
 	trackers[index].mode = 0;
+    trackers[index].confidence=0;
 }
 
 void non_uniform_reset(int index)
@@ -110,16 +169,29 @@ uint32_t check_mode(int64_t stride, int index)
 			break;
 		}
 	}
-	if(conf)
-	{
-		// if mode was 1, set it to 0
-		if(trackers[index].mode == 1)
-		{
-			non_uniform_reset(index);
-			trackers[index].mode = 0;
-		}
-		return 0;
-	}
+	    if(conf)
+    {
+        if(trackers[index].confidence < CONF_MAX)
+            trackers[index].confidence++;
+        if(trackers[index].confidence >= CONF_THRESHOLD)
+        {
+            // uniform confirmed: if mode was 1, set it to 0
+            if(trackers[index].mode == 1)
+            {
+                non_uniform_reset(index);
+                trackers[index].mode = 0;
+            }
+            return 0;
+        }
+    }
+    else
+    {
+        if(trackers[index].confidence > 0)
+            trackers[index].confidence--;
+        // one odd stride doesn't break an established uniform pattern
+        if(trackers[index].mode == 0 && trackers[index].confidence >= CONF_THRESHOLD)
+            return 9;
+    }
 	// if there is any entry which is still 0 - it means not enough strides have been observed yet
 	for(int i = 0; i < UNIFORM_CONFIDENCE_LEVELS; i++)
 	{
@@ -181,7 +253,7 @@ uint32_t check_mode(int64_t stride, int index)
     	do
     	{
     		nus_match_index++;
-    	} while ( 	nus_match_index <= nus_index && 
+    	} while ( 	nus_match_index < nus_index && 
     				non_uniform_strides[nus_match_index] != non_uniform_strides[nus_start_index]
     			);
     	d1 = nus_match_index - nus_start_index;
@@ -196,7 +268,7 @@ uint32_t check_mode(int64_t stride, int index)
     
     // could not find a pattern
     for(int i = nus_start_index; i < nus_match_index; i++)
-    	if(non_uniform_strides[i] != non_uniform_strides[i + nus_match_index])
+    	if(i + nus_match_index >= NON_UNIFORM_PATTERN_MAX_LENGTH ||  non_uniform_strides[i] != non_uniform_strides[i + nus_match_index])
     		return 9;
     
 	/*
@@ -206,7 +278,7 @@ uint32_t check_mode(int64_t stride, int index)
     */
 
     // pattern found
-    trackers[index].repeat_index = 1;
+    trackers[index].repeat_index = 1%nus_match_index;
     trackers[index].repeat_length = nus_match_index;
     trackers[index].found = true;
     return 1;
@@ -217,6 +289,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 {
 	// check for a tracker hit
     uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    update_degree(this);
 
     ip = ip & MASK_IP;
 
@@ -235,6 +308,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         }
         
       	uniform_reset(index);
+        non_uniform_reset(index);
 
         trackers[index].ip = ip;
         trackers[index].last_cl_addr = cl_addr;
@@ -279,38 +353,22 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     if (mode == 0) {
 
         // do some prefetching
-        for (int i=0; i<PREFETCH_DEGREE; i++) {
+        for (int i=0; i<current_degree; i++) {
             uint64_t pf_address = (cl_addr + (stride*(i+1))) << LOG2_BLOCK_SIZE;
 
-            // only issue a prefetch if the prefetch address is in the same 4 KB page
-            // as the current demand access address
-            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+            if (!issue_pf(this, ip, addr, pf_address))
                 break;
-
-            // check the MSHR occupancy to decide if we're going to prefetch to the L1 or L2
-            if (MSHR.occupancy < (MSHR.SIZE>>1))
-              prefetch_line(ip, addr, pf_address, FILL_L1, 0);
-            else
-              prefetch_line(ip, addr, pf_address, FILL_L2, 0);
         }
     } 
     else if(mode == 1 ) // prefetch in mode 1
     {
     	int next_index = trackers[index].repeat_index;
     	uint64_t next_addr = trackers[index].non_uniform_strides[next_index];
-    	for (int i=0; i<PREFETCH_DEGREE; i++) {
+    	for (int i=0; i<current_degree; i++) {
             uint64_t pf_address = (cl_addr + next_addr) << LOG2_BLOCK_SIZE;
 
-            // only issue a prefetch if the prefetch address is in the same 4 KB page
-            // as the current demand access address
-            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+            if (!issue_pf(this, ip, addr, pf_address))
                 break;
-
-            // check the MSHR occupancy to decide if we're going to prefetch to the L1 or L2
-            if (MSHR.occupancy < (MSHR.SIZE>>1))
-              	prefetch_line(ip, addr, pf_address, FILL_L1, 0);
-            else
-              	prefetch_line(ip, addr, pf_address, FILL_L2, 0);
               
             next_index = (next_index + 1) % trackers[index].repeat_length;
             next_addr = next_addr + trackers[index].non_uniform_strides[next_index];
@@ -337,6 +395,11 @@ void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t s
 void CACHE::l1d_prefetcher_final_stats()
 {
 	cout << "CPU " << cpu << " L1D PC-based stride pattern prefetcher final stats" << endl;
-	cout << "Degree: " << PREFETCH_DEGREE << endl;
-
+    cout << "SPP_ISSUED: " << total_issued << endl;
+    cout << "SPP_USEFUL: " << total_useful << endl;
+    if (total_issued > 0)
+        cout << "SPP_ACCURACY: " << 100.0 * total_useful / total_issued << "%" << endl;
+    for (int d = DEG_MIN; d <= DEG_HIGH; d++)
+        cout << "SPP_WINDOWS_AT_DEGREE_" << d << ": " << degree_windows[d] << endl;
+    cout << "SPP_FINAL_DEGREE: " << current_degree << endl;
 }
