@@ -1,13 +1,14 @@
 #include "cache.h"
 
 #define maxRRPV 3
-#define INTERVAL 100
+#define INTERVAL 1000
 #define MOD 16
-#define ITHRESHOLD 15
-#define DTHRESHOLD 50
+#define THRESHOLD 0.35
 
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
-int mode = 0, total_count = 0, misses_count = 0;
+int mode = 0;
+uint64_t leader_total_accesses = 0;
+uint64_t leader_instr_accesses = 0;
 
 // initialize replacement state
 void CACHE::l2c_initialize_replacement()
@@ -73,53 +74,56 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     // cout << "CPU: " << cpu << "  L2C " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
     // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
     
-    if(set % MOD == 0) // leader sets
+    if (set % MOD == 0) 
     {
-    	total_count++;
-    	if(!hit)
-    	{
-    		if(isInstruction)
-    			misses_count++;
-    		else
-    			misses_count--;
-    	}
+        leader_total_accesses++;
+        if (isInstruction) {
+            leader_instr_accesses++;
+        }
+
+        // Check after every INTERVAL accesses to leader sets
+        if (leader_total_accesses >= INTERVAL) 
+        {
+            double instr_ratio = (double)leader_instr_accesses / leader_total_accesses;
+
+            // Single threshold decision logic
+            if (instr_ratio > THRESHOLD) {
+                mode = 1; // Use I-RRIP 
+            } else {
+                mode = 0; // Use regular RRIP
+            }
+
+            // Reset counters for the next interval
+            leader_total_accesses = 0;
+            leader_instr_accesses = 0;
+        }
     }
     
-    if(total_count % INTERVAL == 0) // check after every #INTERVAL accesses to leader sets
+    // Replacement policy update logic based on current mode
+    if (mode == 0) // RRIP
     {
-    	if(misses_count > ITHRESHOLD)
-    		mode = 1;
-    	else if(misses_count < -DTHRESHOLD)
-    		mode = 0;
-    	
-    	//total_count = 0;
-		misses_count = total_count = 0;
+        if (hit)
+            l2_rrpv[set][way] = 0;
+        else
+            l2_rrpv[set][way] = maxRRPV - 1;
     }
-    
-    if(mode == 0) // use RRIP
+    else // I-RRIP
     {
-	    if (hit)
-			l2_rrpv[set][way] = 0;
-		else
-			l2_rrpv[set][way] = maxRRPV-1;
+        if (hit)
+        {
+            if (isInstruction)
+                l2_rrpv[set][way] = 0;
+            else
+                l2_rrpv[set][way] = maxRRPV - 2;
+        }
+        else
+        {
+            if (isInstruction)
+                l2_rrpv[set][way] = maxRRPV - 2;
+            else
+                l2_rrpv[set][way] = maxRRPV - 1;
+        }
     }
-    else // use IRRIP
-    {
-		if (hit)
-		{
-			if(isInstruction)
-			    l2_rrpv[set][way] = 0;
-			else
-				l2_rrpv[set][way] = maxRRPV-2;
-		}
-		else
-		{
-			if(isInstruction)
-				l2_rrpv[set][way] = maxRRPV-2;
-			else
-				l2_rrpv[set][way] = maxRRPV-1;
-		}
-    } 
 }
 
 // use this function to print out your own stats at the end of simulation
