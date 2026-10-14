@@ -8,11 +8,11 @@ uint32_t l2_rrpv[L2C_SET][L2C_WAY];
 // Initialize replacement state
 void CACHE::l2c_initialize_replacement()
 {
-    cout << "Initialize I-RRIP state for L2C" << endl;
+    cout << "Initialize I-RRIP Design 4 for L2C" << endl;
 
-    for (int i = 0; i < L2C_SET; i++) {
-        for (int j = 0; j < L2C_WAY; j++) {
-            l2_rrpv[i][j] = maxRRPV;
+    for (uint32_t set = 0; set < L2C_SET; set++) {
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            l2_rrpv[set][way] = maxRRPV;
         }
     }
 }
@@ -27,34 +27,33 @@ uint32_t CACHE::l2c_find_victim(
     uint64_t full_addr,
     uint32_t type)
 {
-    while (1)
-    {
-        // First preference: evict a data line at max RRPV
-        for (int i = 0; i < L2C_WAY; i++) {
-            if (l2_rrpv[set][i] == maxRRPV &&
-                !current_set[i].instruction) {
-                return i;
+    while (true) {
+
+        // First preference: evict a data line at RRPV 11
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            if (l2_rrpv[set][way] == maxRRPV &&
+                !current_set[way].instruction) {
+                return way;
             }
         }
 
-        // If no data line qualifies, evict any line at max RRPV
-        for (int i = 0; i < L2C_WAY; i++) {
-            if (l2_rrpv[set][i] == maxRRPV) {
-                return i;
+        // Otherwise, evict any line at RRPV 11
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            if (l2_rrpv[set][way] == maxRRPV) {
+                return way;
             }
         }
 
-        // Increase RRPV values until a victim becomes available
-        for (int i = 0; i < L2C_WAY; i++) {
-            l2_rrpv[set][i]++;
+        // Age RRPVs, saturating at RRPV 11
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            if (l2_rrpv[set][way] < maxRRPV) {
+                l2_rrpv[set][way]++;
+            }
         }
     }
-
-    assert(0);
-    return 0;
 }
 
-// Called on every cache hit and cache fill
+
 void CACHE::l2c_update_replacement_state(
     uint32_t cpu,
     uint32_t set,
@@ -93,18 +92,29 @@ void CACHE::l2c_update_replacement_state(
     if ((type == WRITEBACK) && ip)
         assert(0);
 
-    // Promotion: instruction and data hits go to RRPV 0
     if (hit) {
-        l2_rrpv[set][way] = 0;
-    }
-    // Insertion: instruction starts at RRPV 2, data at RRPV 3
-    else {
+        // Promotion: instruction -> 00, data -> 01
         if (isInstruction)
-            l2_rrpv[set][way] = maxRRPV - 1;
+            l2_rrpv[set][way] = 0;
         else
+            l2_rrpv[set][way] = 1;
+    }
+    else {
+        // Insertion: data -> 11
+        if (!isInstruction) {
             l2_rrpv[set][way] = maxRRPV;
+        }
+        else {
+            // Instruction insertion:
+            // 25% probability -> 01, 75% probability -> 10
+            if ((rand() % 100) < 25)
+                l2_rrpv[set][way] = 1;
+            else
+                l2_rrpv[set][way] = 2;
+        }
     }
 }
+
 
 // Print replacement statistics
 void CACHE::l2c_replacement_final_stats()
