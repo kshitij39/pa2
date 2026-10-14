@@ -1,0 +1,112 @@
+
+#include "cache.h"
+
+#define maxRRPV 3
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+// Initialize replacement state
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize I-RRIP state for L2C" << endl;
+
+    for (int i = 0; i < L2C_SET; i++) {
+        for (int j = 0; j < L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+        }
+    }
+}
+
+// Find replacement victim
+uint32_t CACHE::l2c_find_victim(
+    uint32_t cpu,
+    uint64_t instr_id,
+    uint32_t set,
+    const BLOCK *current_set,
+    uint64_t ip,
+    uint64_t full_addr,
+    uint32_t type)
+{
+    while (1)
+    {
+        // First preference: evict a data line at max RRPV
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV &&
+                !current_set[i].instruction) {
+                return i;
+            }
+        }
+
+        // If no data line qualifies, evict any line at max RRPV
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV) {
+                return i;
+            }
+        }
+
+        // Increase RRPV values until a victim becomes available
+        for (int i = 0; i < L2C_WAY; i++) {
+            l2_rrpv[set][i]++;
+        }
+    }
+
+    assert(0);
+    return 0;
+}
+
+// Called on every cache hit and cache fill
+void CACHE::l2c_update_replacement_state(
+    uint32_t cpu,
+    uint32_t set,
+    uint32_t way,
+    uint64_t full_addr,
+    uint64_t ip,
+    uint64_t victim_addr,
+    uint32_t type,
+    uint8_t hit,
+    uint8_t isInstruction)
+{
+    string TYPE_NAME;
+
+    if (type == LOAD)
+        TYPE_NAME = "LOAD";
+    else if (type == RFO)
+        TYPE_NAME = "RFO";
+    else if (type == PREFETCH)
+        TYPE_NAME = "PF";
+    else if (type == WRITEBACK)
+        TYPE_NAME = "WB";
+    else if (type == LOAD_TRANSLATION)
+        TYPE_NAME = "L_TN";
+    else if (type == PREFETCH_TRANSLATION)
+        TYPE_NAME = "P_TN";
+    else if (type == TRANSLATION_FROM_L1D)
+        TYPE_NAME = "TN_L1D";
+    else
+        assert(0);
+
+    if (hit)
+        TYPE_NAME += "_HIT";
+    else
+        TYPE_NAME += "_MISS";
+
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    // Promotion: instruction and data hits go to RRPV 0
+    if (hit) {
+        l2_rrpv[set][way] = 0;
+    }
+    // Insertion: instruction starts at RRPV 2, data at RRPV 3
+    else {
+        if (isInstruction)
+            l2_rrpv[set][way] = maxRRPV - 1;
+        else
+            l2_rrpv[set][way] = maxRRPV;
+    }
+}
+
+// Print replacement statistics
+void CACHE::l2c_replacement_final_stats()
+{
+}
