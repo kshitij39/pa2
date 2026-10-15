@@ -1,16 +1,332 @@
 #include "cache.h"
 
 
+#define IP_TRACKER_COUNT 24
+#define PREFETCH_DEGREE 3
+#define MASK_IP 0xFF
+#define UNIFORM_CONFIDENCE_LEVELS 1
+#define NON_UNIFORM_PATTERN_MAX_LENGTH 100  //actual max length would be half of this
+
+class IP_TRACKER {
+  public:
+    // the IP we're tracking
+    uint64_t ip;
+
+    // the last address accessed by this IP
+    uint64_t last_cl_addr;
+
+    // the last #UNIFORM_CONFIDENCE_LEVELS strides
+    int64_t last_strides[UNIFORM_CONFIDENCE_LEVELS];
+    int64_t ls_index;
+    
+    // for non uniform patterns
+    int64_t non_uniform_strides[NON_UNIFORM_PATTERN_MAX_LENGTH];
+    int64_t nus_index;
+    int64_t nus_start_index;
+    int64_t nus_match_index;
+    int64_t repeat_index;
+    int64_t repeat_length;
+    bool found;
+    
+    // mode: 0 - uniform, 1 - non uniform
+    uint32_t mode;
+
+    // use LRU to evict old IP trackers
+    uint32_t lru;
+
+    IP_TRACKER () {
+        ip = 0;
+        last_cl_addr = 0;
+        // for uniform strides
+    	for(int j = 0; j < UNIFORM_CONFIDENCE_LEVELS; j++)
+	    	last_strides[j] = 0;
+	    ls_index = 0;
+	    
+	    // for non-uniform strides
+	    for(int j = 0; j < NON_UNIFORM_PATTERN_MAX_LENGTH; j++)
+	    	non_uniform_strides[j] = 0;
+	    nus_index = 0;
+	    nus_start_index = 0;
+	    nus_match_index = 0;
+	    found = false;
+	    
+	    mode = 0;
+	    
+        lru = 0;
+    };
+};
+
+IP_TRACKER trackers[IP_TRACKER_COUNT];
+
+
 void CACHE::l1d_prefetcher_initialize() 
 {
     std::cout << "------------------------------------------------" << std::endl;
     std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
+    
+	cout << "CPU " << cpu << " L1D IP-based stride pattern prefetcher" << endl;
+	for (int i=0; i<IP_TRACKER_COUNT; i++)
+    {
+    	trackers[i].lru = i;
+    }
+}
+
+void uniform_reset(int index)
+{
+	for(int j = 0; j < UNIFORM_CONFIDENCE_LEVELS; j++)
+	    	trackers[index].last_strides[j] = 0;
+	trackers[index].ls_index = 0;
+	trackers[index].mode = 0;
+}
+
+void non_uniform_reset(int index)
+{
+    trackers[index].nus_index = 0;
+	trackers[index].nus_start_index = 0;
+    trackers[index].nus_match_index = 0;
+    trackers[index].repeat_index = 0;
+    trackers[index].repeat_length = 0;
+    trackers[index].found = false;
+    for(int j = 0; j < NON_UNIFORM_PATTERN_MAX_LENGTH; j++)
+    	trackers[index].non_uniform_strides[j] = 0;
+}
+
+
+// return value 
+//	0 - mode 0
+//	1 - mode 1
+//	9 - conitnue with the existing mode - no prefetching will be done
+uint32_t check_mode(int64_t stride, int index)
+{
+	// check for uniform strides first
+	int64_t *last_strides = trackers[index].last_strides;
+	bool conf = true;
+	for(int i = 0; i < UNIFORM_CONFIDENCE_LEVELS; i++)
+	{
+		if(stride != last_strides[i])
+		{
+			conf = false;
+			break;
+		}
+	}
+	if(conf)
+	{
+		// if mode was 1, set it to 0
+		if(trackers[index].mode == 1)
+		{
+			non_uniform_reset(index);
+			trackers[index].mode = 0;
+		}
+		return 0;
+	}
+	// if there is any entry which is still 0 - it means not enough strides have been observed yet
+	for(int i = 0; i < UNIFORM_CONFIDENCE_LEVELS; i++)
+	{
+		if(0 == last_strides[i])
+		{
+			return 9;
+		}
+	}
+	// non uniform stride observed
+	// start storing strides from this stride onwards
+	if(trackers[index].mode == 0) 
+	{
+		non_uniform_reset(index);
+		trackers[index].non_uniform_strides[0] = stride;
+		trackers[index].mode = 1;
+		return 9;
+	}
+	
+	// if there is any existing non uniform pattern already found - return 1
+    if(trackers[index].found && stride == trackers[index].non_uniform_strides[trackers[index].repeat_index])
+    {
+    	trackers[index].repeat_index = (trackers[index].repeat_index + 1) % trackers[index].repeat_length;
+    	return 1;    
+    }
+
+	// reset if no pattern found after observing #NON_UNIFORM_PATTERN_MAX_LENGTH strides
+    if(trackers[index].nus_index == NON_UNIFORM_PATTERN_MAX_LENGTH - 1)
+    {
+    	non_uniform_reset(index);
+    	trackers[index].mode = 0;
+	    return 9;
+    }
+    
+    // start storing strides in mode 1 and check for pattern
+    trackers[index].nus_index = trackers[index].nus_index + 1;
+	trackers[index].non_uniform_strides[trackers[index].nus_index] = stride;
+	
+	int64_t *non_uniform_strides = trackers[index].non_uniform_strides;
+    int64_t nus_index = trackers[index].nus_index;
+    int64_t nus_start_index = trackers[index].nus_start_index;
+    int64_t nus_match_index = trackers[index].nus_match_index;    
+    
+    
+    if(nus_match_index == 0 && stride == non_uniform_strides[nus_start_index])
+    {
+    	trackers[index].nus_match_index = nus_index;
+    	return 9;
+    }
+    
+    
+    if(non_uniform_strides[nus_index] != non_uniform_strides[nus_start_index])
+    	return 9;
+    
+    int64_t d1 = nus_match_index - nus_start_index;
+    int64_t d2 = nus_index - nus_match_index;
+
+  	while(d2 > d1)
+    {
+    	do
+    	{
+    		nus_match_index++;
+    	} while ( 	nus_match_index <= nus_index && 
+    				non_uniform_strides[nus_match_index] != non_uniform_strides[nus_start_index]
+    			);
+    	d1 = nus_match_index - nus_start_index;
+    	d2 = nus_index - nus_match_index;
+    }
+    
+    trackers[index].nus_match_index = nus_match_index;
+    
+ 	// could not find a pattern
+    if(d2 < d1)
+    	return 9;
+    
+    // could not find a pattern
+    for(int i = nus_start_index; i < nus_match_index; i++)
+    	if(non_uniform_strides[i] != non_uniform_strides[i + nus_match_index])
+    		return 9;
+    
+	/*
+    for(int j = 0; j <= nus_index; j++)
+    	std::cout << non_uniform_strides[j] << " ";
+    std::cout << std::endl;
+    */
+
+    // pattern found
+    trackers[index].repeat_index = 1;
+    trackers[index].repeat_length = nus_match_index;
+    trackers[index].found = true;
+    return 1;
+	
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+	// check for a tracker hit
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+
+    ip = ip & MASK_IP;
+
+    int index = -1;
+    for (index=0; index<IP_TRACKER_COUNT; index++) {
+        if (trackers[index].ip == ip)
+            break;
+    }
+
+    // this is a new IP that doesn't have a tracker yet, so allocate one
+    if (index == IP_TRACKER_COUNT) {
+
+        for (index=0; index<IP_TRACKER_COUNT; index++) {
+            if (trackers[index].lru == (IP_TRACKER_COUNT-1))
+                break;
+        }
+        
+      	uniform_reset(index);
+
+        trackers[index].ip = ip;
+        trackers[index].last_cl_addr = cl_addr;
+		for (int i=0; i<IP_TRACKER_COUNT; i++) {
+            if (trackers[i].lru < trackers[index].lru)
+                trackers[i].lru++;
+        }
+        trackers[index].lru = 0;
+
+        return; //metadata_in;
+    }
+
+	// sanity check
+    // at this point we should know a matching tracker index
+    if (index == -1)
+        assert(0);
+
+    // calculate the stride between the current address and the last address
+    // this bit appears overly complicated because we're calculating
+    // differences between unsigned address variables
+    int64_t stride = 0;
+    if (cl_addr > trackers[index].last_cl_addr)
+        stride = cl_addr - trackers[index].last_cl_addr;
+    else {
+        stride = trackers[index].last_cl_addr - cl_addr;
+        stride *= -1;
+    }
+
+    //cout << "[IP_STRIDE] HIT  index: " << index << " lru: " << trackers[index].lru << " ip: " << hex << ip << " cl_addr: " << cl_addr << dec << " stride: " << stride << endl;
+
+    // don't do anything if we somehow saw the same address twice in a row
+    if (stride == 0)
+        return;	//metadata_in;
+
+    // only do any prefetching if there's a pattern of seeing the same
+    // stride more than once
+    
+    
+    // if mode == 9 then no prefetching
+    uint32_t mode = check_mode(stride, index);
+    // prefetch in mode 0
+    if (mode == 0) {
+
+        // do some prefetching
+        for (int i=0; i<PREFETCH_DEGREE; i++) {
+            uint64_t pf_address = (cl_addr + (stride*(i+1))) << LOG2_BLOCK_SIZE;
+
+            // only issue a prefetch if the prefetch address is in the same 4 KB page
+            // as the current demand access address
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                break;
+
+            // check the MSHR occupancy to decide if we're going to prefetch to the L1 or L2
+            if (MSHR.occupancy < (MSHR.SIZE>>1))
+              prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+            else
+              prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+        }
+    } 
+    else if(mode == 1 ) // prefetch in mode 1
+    {
+    	int next_index = trackers[index].repeat_index;
+    	uint64_t next_addr = trackers[index].non_uniform_strides[next_index];
+    	for (int i=0; i<PREFETCH_DEGREE; i++) {
+            uint64_t pf_address = (cl_addr + next_addr) << LOG2_BLOCK_SIZE;
+
+            // only issue a prefetch if the prefetch address is in the same 4 KB page
+            // as the current demand access address
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                break;
+
+            // check the MSHR occupancy to decide if we're going to prefetch to the L1 or L2
+            if (MSHR.occupancy < (MSHR.SIZE>>1))
+              	prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+            else
+              	prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+              
+            next_index = (next_index + 1) % trackers[index].repeat_length;
+            next_addr = next_addr + trackers[index].non_uniform_strides[next_index];
+        }
+    }
+
+    trackers[index].last_cl_addr = cl_addr;
+    trackers[index].last_strides[trackers[index].ls_index] = stride;
+    trackers[index].ls_index = (trackers[index].ls_index + 1) % UNIFORM_CONFIDENCE_LEVELS;
+
+    for (int i=0; i<IP_TRACKER_COUNT; i++) {
+        if (trackers[i].lru < trackers[index].lru)
+            trackers[i].lru++;
+    }
+    trackers[index].lru = 0;
+    return; //metadata_in;
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
@@ -20,5 +336,7 @@ void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t s
 
 void CACHE::l1d_prefetcher_final_stats()
 {
+	cout << "CPU " << cpu << " L1D PC-based stride pattern prefetcher final stats" << endl;
+	cout << "Degree: " << PREFETCH_DEGREE << endl;
 
 }
