@@ -1,0 +1,191 @@
+#include "cache.h"
+
+#define maxRRPV 3
+
+// Set dueling: in every 64 sets, slot 0 = I-RRIP leader, slot 32 = RRIP leader, rest = followers
+#define LEADER_STRIDE      64
+#define IRRIP_LEADER_SLOT  0
+#define RRIP_LEADER_SLOT   32
+
+// Followers use I-RRIP when score > threshold
+#define SCORE_THRESHOLD 0.05
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+// Demand access/miss counts from RRIP leader sets (after warmup)
+uint64_t instruction_accesses = 0;
+uint64_t data_accesses        = 0;
+uint64_t instruction_misses   = 0;
+uint64_t data_misses          = 0;
+
+enum set_kind {
+    IRRIP_LEADER,
+    RRIP_LEADER,
+    FOLLOWER
+};
+
+static set_kind get_set_kind(uint32_t set)
+{
+    uint32_t slot = set % LEADER_STRIDE;
+
+    if (slot == IRRIP_LEADER_SLOT)
+        return IRRIP_LEADER;
+
+    if (slot == RRIP_LEADER_SLOT)
+        return RRIP_LEADER;
+
+    return FOLLOWER;
+}
+
+// score = (instr accesses + instr misses) / (total accesses + total misses)
+static double calculate_score()
+{
+    uint64_t total_accesses = instruction_accesses + data_accesses;
+    uint64_t total_misses   = instruction_misses + data_misses;
+    uint64_t denominator    = total_accesses + total_misses;
+
+    if (denominator == 0)
+        return 0.0;
+
+    return static_cast<double>(instruction_accesses + instruction_misses)
+           / static_cast<double>(denominator);
+}
+
+// Leaders keep their fixed policy; followers decide by score
+static bool use_irrip(uint32_t set)
+{
+    set_kind kind = get_set_kind(set);
+
+    if (kind == IRRIP_LEADER)
+        return true;
+
+    if (kind == RRIP_LEADER)
+        return false;
+
+    return calculate_score() > SCORE_THRESHOLD;
+}
+
+// Initialize replacement state
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize Dynamic I-RRIP for L2C" << endl;
+
+    for (uint32_t set = 0; set < L2C_SET; set++) {
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            l2_rrpv[set][way] = maxRRPV;
+        }
+    }
+
+    instruction_accesses = 0;
+    data_accesses = 0;
+    instruction_misses = 0;
+    data_misses = 0;
+}
+
+// Find replacement victim
+uint32_t CACHE::l2c_find_victim(
+    uint32_t cpu,
+    uint64_t instr_id,
+    uint32_t set,
+    const BLOCK *current_set,
+    uint64_t ip,
+    uint64_t full_addr,
+    uint32_t type)
+{
+    bool irrip_mode = use_irrip(set);
+
+    while (true) {
+
+        // I-RRIP: prefer a data line at RRPV 3
+        if (irrip_mode) {
+            for (uint32_t way = 0; way < L2C_WAY; way++) {
+                if (l2_rrpv[set][way] == maxRRPV &&
+                    !current_set[way].instruction) {
+                    return way;
+                }
+            }
+        }
+
+        // Any line at RRPV 3
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            if (l2_rrpv[set][way] == maxRRPV) {
+                return way;
+            }
+        }
+
+        // Age all lines
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            if (l2_rrpv[set][way] < maxRRPV)
+                l2_rrpv[set][way]++;
+        }
+    }
+}
+
+// Called on every cache hit and cache fill
+void CACHE::l2c_update_replacement_state(
+    uint32_t cpu,
+    uint32_t set,
+    uint32_t way,
+    uint64_t full_addr,
+    uint64_t ip,
+    uint64_t victim_addr,
+    uint32_t type,
+    uint8_t hit,
+    uint8_t isInstruction)
+{
+    set_kind kind = get_set_kind(set);
+
+    // Update RRIP leader statistics (demand only, after warmup)
+    if (kind == RRIP_LEADER &&
+        warmup_complete[cpu] &&
+        type != WRITEBACK &&
+        type != PREFETCH) {
+
+        if (isInstruction)
+            instruction_accesses++;
+        else
+            data_accesses++;
+
+        if (!hit) {
+            if (isInstruction)
+                instruction_misses++;
+            else
+                data_misses++;
+        }
+    }
+
+    if (use_irrip(set)) {
+        // I-RRIP
+        if (hit) {
+            // Promotion: instruction -> 0, data -> 1
+            if (isInstruction)
+                l2_rrpv[set][way] = 0;
+            else
+                l2_rrpv[set][way] = 1;
+        }
+        else {
+            // Insertion: data -> 3, instruction -> 1 (25%) or 2 (75%)
+            if (!isInstruction) {
+                l2_rrpv[set][way] = maxRRPV;
+            }
+            else {
+                if ((rand() % 100) < 25)
+                    l2_rrpv[set][way] = 1;
+                else
+                    l2_rrpv[set][way] = 2;
+            }
+        }
+    }
+    else {
+        // SRRIP
+        if (hit)
+            l2_rrpv[set][way] = 0;
+        else
+            l2_rrpv[set][way] = maxRRPV - 1;
+    }
+}
+
+// Print replacement statistics
+void CACHE::l2c_replacement_final_stats()
+{
+}
